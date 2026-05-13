@@ -1,3 +1,22 @@
+/*
+  Rifle Level iOS App
+  File: ContentView.swift
+  Version: v0.3.0
+
+  Changes in v0.3.0:
+  - Added pitch movement to the reticle marker.
+  - Marker X position = cant.
+  - Marker Y position = pitch.
+  - Reticle angle text now shows cant and pitch.
+  - Reticle angle, L / 0 / R, and LEVEL / LEFT / RIGHT text use matching font size.
+  - Reticle labels moved closer to the outer circle.
+  - Debug toggle, diagnostics, battery status, and compact header retained.
+
+  Notes:
+  - BLEManager.swift does not need to change for this update.
+  - If pitch moves the wrong direction, change displayPitchSign from 1.0 to -1.0.
+*/
+
 import SwiftUI
 import Combine
 
@@ -9,8 +28,12 @@ struct ContentView: View {
     @State private var now = Date()
 
     private let displayCantSign: Double = 1.0
+    private let displayPitchSign: Double = 1.0
+
     private let levelTolerance: Double = 0.6
     private let maxDisplayCant: Double = 10.0
+    private let maxDisplayPitch: Double = 20.0
+    private let reticleLabelSize: CGFloat = 18
 
     private let batteryGood: Double = 3.75
     private let batteryOk: Double = 3.50
@@ -128,6 +151,7 @@ struct ContentView: View {
             if scannerDevices.isEmpty {
                 VStack(spacing: 8) {
                     ProgressView()
+
                     Text(showAllDevices ? "No BLE devices found yet" : "RifleLevel not found yet")
                         .font(.caption)
                         .foregroundStyle(.gray)
@@ -197,10 +221,21 @@ struct ContentView: View {
         GeometryReader { geometry in
             let size = min(geometry.size.width, geometry.size.height)
             let center = CGPoint(x: geometry.size.width / 2, y: geometry.size.height / 2)
-            let radius = size * 0.42
+
+            let outerRadius = size * 0.48
+            let travelRadius = size * 0.36
+
             let clampedCant = min(max(displayCant, -maxDisplayCant), maxDisplayCant)
-            let normalized = clampedCant / maxDisplayCant
-            let markerX = center.x + CGFloat(normalized) * radius
+            let normalizedCant = clampedCant / maxDisplayCant
+            let markerX = center.x + CGFloat(normalizedCant) * travelRadius
+
+            let clampedPitch = min(max(displayPitch, -maxDisplayPitch), maxDisplayPitch)
+            let normalizedPitch = clampedPitch / maxDisplayPitch
+
+            // Positive pitch moves marker upward.
+            let markerY = center.y - CGFloat(normalizedPitch) * travelRadius
+
+            let labelFont = Font.system(size: reticleLabelSize, weight: .bold)
 
             ZStack {
                 Circle()
@@ -210,51 +245,66 @@ struct ContentView: View {
                     .stroke(Color.gray.opacity(0.18), lineWidth: 1)
                     .frame(width: size * 0.68, height: size * 0.68)
 
+                // Horizontal cant reference line
                 Rectangle()
                     .fill(Color.gray.opacity(0.45))
                     .frame(width: size * 0.78, height: 2)
                     .position(center)
 
+                // Vertical pitch reference line
                 Rectangle()
-                    .fill(Color.green.opacity(0.9))
-                    .frame(width: 3, height: size * 0.35)
+                    .fill(Color.gray.opacity(0.35))
+                    .frame(width: 2, height: size * 0.78)
                     .position(center)
 
+                // Center level window
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.green.opacity(0.18))
                     .frame(width: size * 0.12, height: 18)
                     .position(center)
 
+                // Center zero mark
+                Circle()
+                    .stroke(Color.green.opacity(0.75), lineWidth: 2)
+                    .frame(width: 18, height: 18)
+                    .position(center)
+
+                // Moving marker:
+                // X = cant
+                // Y = pitch
                 Circle()
                     .fill(levelStatusColor)
                     .frame(width: 34, height: 34)
                     .shadow(color: levelStatusColor.opacity(0.8), radius: 10)
-                    .position(x: markerX, y: center.y)
+                    .position(x: markerX, y: markerY)
 
-                Text(String(format: "%.2f°", displayCant))
-                    .font(.system(size: 30, weight: .bold))
+                // Top angle readout, closer to outer circle
+                Text(String(format: "C %.2f°   P %.2f°", displayCant, displayPitch))
+                    .font(labelFont)
                     .foregroundStyle(.white)
-                    .position(x: center.x, y: center.y - radius * 0.62)
+                    .position(x: center.x, y: center.y - outerRadius * 0.76)
 
+                // Left / center / right labels, same font size
                 Text("L")
-                    .font(.headline)
+                    .font(labelFont)
                     .foregroundStyle(.red)
-                    .position(x: center.x - radius, y: center.y + radius * 0.45)
-
-                Text("R")
-                    .font(.headline)
-                    .foregroundStyle(.blue)
-                    .position(x: center.x + radius, y: center.y + radius * 0.45)
+                    .position(x: center.x - outerRadius * 0.82, y: center.y + outerRadius * 0.52)
 
                 Text("0")
-                    .font(.caption)
+                    .font(labelFont)
                     .foregroundStyle(.green)
-                    .position(x: center.x, y: center.y + radius * 0.45)
+                    .position(x: center.x, y: center.y + outerRadius * 0.52)
 
+                Text("R")
+                    .font(labelFont)
+                    .foregroundStyle(.blue)
+                    .position(x: center.x + outerRadius * 0.82, y: center.y + outerRadius * 0.52)
+
+                // LEVEL / LEFT / RIGHT, same font size and closer to outer circle
                 Text(levelStatusText)
-                    .font(.system(size: 22, weight: .black))
+                    .font(labelFont)
                     .foregroundStyle(levelStatusColor)
-                    .position(x: center.x, y: center.y + radius * 0.68)
+                    .position(x: center.x, y: center.y + outerRadius * 0.76)
             }
         }
     }
@@ -285,7 +335,7 @@ struct ContentView: View {
                 .background(Color.white.opacity(0.25))
 
             HStack(spacing: 12) {
-                compactMetric("Pitch", String(format: "%.2f°", bleManager.levelData.pitch))
+                compactMetric("Pitch", String(format: "%.2f°", displayPitch))
                 compactMetric("Cosine", String(format: "%.3f", bleManager.levelData.cosine))
                 compactMetric("Stability", "\(bleManager.levelData.stability)%")
             }
@@ -485,6 +535,10 @@ struct ContentView: View {
 
     private var displayCant: Double {
         bleManager.levelData.cant * displayCantSign
+    }
+
+    private var displayPitch: Double {
+        bleManager.levelData.pitch * displayPitchSign
     }
 
     private var levelStatusText: String {
