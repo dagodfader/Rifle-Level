@@ -1,39 +1,24 @@
 # Rifle Level
 
-Rifle-mounted electronic level using a Seeed Studio XIAO nRF52840 Sense.
+DIY electronic rifle cant level using a Seeed Studio XIAO nRF52840 Sense, onboard IMU, 3 external LEDs, LiPo battery, and BLE app support.
 
-The device uses the onboard IMU to detect rifle cant/roll angle and drives three external LEDs for left / level / right indication. Bluetooth is used for app data, setup, diagnostics, pitch, cosine, stability, and battery voltage.
+Current firmware version: **v0.2.9**
 
-The physical LEDs are the primary shooting display. The phone app is mainly for setup, tuning, diagnostics, pitch/cosine, stability, and future shot log support.
-
----
-
-## Current Firmware
-
-Current version: **v0.2.5**
-
-Arduino sketch:
+Firmware location:
 
 ```text
 firmware/Rifle_Level/Rifle_Level.ino
 ```
 
----
-
 ## Hardware
 
 - Seeed Studio XIAO nRF52840 Sense
 - Onboard LSM6DS3 IMU
-- 3 external LEDs
-  - Left LED
-  - Center / level LED
-  - Right LED
+- 3 external LEDs for left / level / right indication
 - LiPo battery
-- Calibration / brightness button
-- Onboard RGB LED for battery status
-- Compact 3D printed enclosure
-
----
+- Slide power switch
+- Calibration button
+- Compact 3D printed side-mounted enclosure
 
 ## LED Pins
 
@@ -42,237 +27,157 @@ firmware/Rifle_Level/Rifle_Level.ino
 | Left LED | D0 |
 | Center / Level LED | D1 |
 | Right LED | D2 |
-| Button | D3 |
-
----
+| Calibration / brightness button | D3 |
 
 ## Main Features
 
-- Roll / cant LED level indication
-- Saved cant calibration using LittleFS
-- Button brightness control
-- Button calibration reset
-- Bluetooth UART output for iOS app
-- BLE advertising timeout
-- Startup battery status
-- Low battery RGB warning
+- 3-LED cant indication
+- Saved cant calibration
+- Saved pitch calibration
+- iOS BLE app data output
+- BLE app calibration commands
 - Pitch angle output
 - Angle cosine output
-- Stability score output
+- Stability score
+- Battery voltage output
+- Startup battery status using onboard RGB LED
+- Low battery warning using onboard RGB LED
+- Adjustable LED brightness using the button
+- BLE advertising timeout to reduce unnecessary broadcasting
 
----
+## BLE Output
 
-## BLE Behavior
+Firmware v0.2.9 uses short BLE packets to reduce truncation and reduce physical LED slowdown while BLE is connected.
 
-Firmware v0.2.5 sends app data as three small rotating BLE packets.
-
-This was done to reduce BLE UART truncation and reduce slowdown compared to sending one long packet.
-
-Example BLE output:
+Fast live packets alternate every **150 ms**:
 
 ```text
-v:1,c:-0.42,o:0.10
+c:-0.42
 p:1.80,x:0.999
-s:82,b:3.92
 ```
 
-The firmware sends one small BLE packet every 150 ms.
-
-A full app data refresh takes about:
+Slow status packets alternate every **2000 ms**:
 
 ```text
-450 ms
+o:0.10,s:82
+b:3.92,cc:1,pc:1
 ```
-
----
 
 ## BLE Field Meanings
 
-| Field | Example | Meaning |
-|---|---:|---|
-| v | 1 | BLE format version |
-| c | -0.42 | App cant angle in degrees |
-| o | 0.10 | Cant calibration offset |
-| p | 1.80 | Rifle pitch angle |
-| x | 0.999 | Angle cosine based on pitch |
-| s | 82 | Stability score, 0–100 |
-| b | 3.92 | Battery voltage |
+| Field | Meaning |
+|---|---|
+| `c` | Cant angle for the app |
+| `p` | Pitch angle |
+| `x` | Angle cosine value |
+| `o` | Saved cant offset |
+| `s` | Stability score |
+| `b` | Battery voltage |
+| `cc` | Cant calibration saved flag, `1` = saved, `0` = not saved |
+| `pc` | Pitch calibration saved flag, `1` = saved, `0` = not saved |
 
----
+Firmware version is **not currently sent over BLE**. This keeps live packets short and helps avoid BLE truncation.
 
-## BLE Advertising Timeout
+## BLE App Commands
 
-Bluetooth advertising starts when the rifle level powers on.
+The iOS app can send BLE UART commands to control calibration.
 
-If no phone connects within 60 seconds, BLE advertising stops.
+| Command | Alias | Function | Firmware Reply |
+|---|---|---|---|
+| `ZERO_CANT` | `ZC` | Save current cant as zero | `ack:ZERO_CANT` |
+| `RESET_CANT` | `RC` | Reset cant zero | `ack:RESET_CANT` |
+| `ZERO_PITCH` | `ZP` | Save current pitch as zero | `ack:ZERO_PITCH` |
+| `RESET_PITCH` | `RP` | Reset pitch zero | `ack:RESET_PITCH` |
 
-If a phone connects, BLE stays active.
+Commands can end with `\n`, `\r`, or no line ending.
 
-If the phone disconnects, BLE advertising restarts for another 60 seconds.
+Unknown commands reply:
 
-This helps reduce unnecessary Bluetooth advertising and keeps the physical LED function prioritized.
+```text
+err:UNKNOWN
+```
 
----
+Command buffer overflow replies:
+
+```text
+err:BUFFER
+```
 
 ## Button Functions
 
-| Button Action | Hold Time | Function |
-|---|---:|---|
-| Short tap | Less than 1 second | Change LED brightness |
-| Medium hold | 1 to 2 seconds | No action |
-| Calibration hold | 2 to 5 seconds | Save cant zero calibration |
-| Long hold | 5 seconds or longer | Reset saved cant calibration |
-
----
+| Button Action | Function |
+|---|---|
+| Tap under 1 second | Cycle LED brightness |
+| Hold 2–5 seconds | Save cant zero calibration |
+| Hold 5+ seconds | Reset cant calibration |
 
 ## Brightness Levels
 
-A short button tap cycles through three LED brightness levels.
-
-| Mode | Brightness Value | Feedback |
-|---|---:|---|
-| Dim | 4 | Center LED blinks 1 time |
-| Normal | 15 | Center LED blinks 2 times |
-| Bright | 40 | Center LED blinks 3 times |
-
-Default brightness on startup:
+The firmware has three LED brightness levels:
 
 ```text
-Normal / 15
+4
+15
+40
 ```
 
-Brightness is not currently saved after power-off.
-
----
-
-## Startup LED Behavior
-
-When the device powers on:
+Default brightness is:
 
 ```text
-1. Brief external LED boot flash may happen
-2. Onboard RGB LED shows battery status
-3. External LEDs show calibration status
-4. Normal level operation begins
+15
 ```
 
-A brief boot flash can happen before the firmware fully takes control of the LED pins.
+Button tap feedback:
 
----
-
-## Startup Battery Status
-
-The onboard RGB LED shows battery status for about 2 seconds at startup.
-
-| Battery Voltage | Onboard RGB LED |
+| Brightness Mode | Feedback |
 |---|---|
-| 3.75V or higher | Green |
-| 3.50V to 3.74V | Yellow |
-| Below 3.50V | Red |
+| Dim | Center LED blinks 1 time |
+| Normal | Center LED blinks 2 times |
+| Bright | Center LED blinks 3 times |
 
-After the startup battery check, the RGB LED turns off.
+## Startup Behavior
 
----
+On power-up:
 
-## Startup Calibration Status
+1. The onboard RGB LED shows battery status for about 2 seconds.
+2. The external LEDs show cant calibration status.
+3. Normal level operation begins.
 
-After battery status, the external LEDs show calibration status.
+Battery startup colors:
 
-| Calibration State | External LED Behavior |
+| Color | Meaning |
 |---|---|
-| Saved calibration found | All 3 external LEDs solid for 2 seconds |
-| No saved calibration | All 3 external LEDs flash 3 times slowly |
+| Green | Battery good |
+| Yellow | Battery low |
+| Red | Battery very low |
 
-After this, the device enters normal level mode.
+Cant calibration startup status:
 
----
+| LED Pattern | Meaning |
+|---|---|
+| All 3 external LEDs solid for about 2 seconds | Cant calibration saved |
+| All 3 external LEDs flash slowly 3 times | No cant calibration saved |
 
-## Low Battery Warning During Use
+Pitch calibration is saved and reported to the app with `pc:1`, but it does not have a separate startup LED pattern.
 
-During normal operation, the onboard RGB LED gives a low battery warning.
+## Low Battery Warning
 
-| Battery Voltage | Warning Behavior |
+During normal operation, the onboard RGB LED gives battery warnings:
+
+| Battery Voltage | Warning |
 |---|---|
 | Above 3.50V | RGB LED off |
-| 3.30V to 3.50V | Yellow pulse every 10 seconds |
+| 3.30V–3.50V | Yellow pulse every 10 seconds |
 | Below 3.30V | Red pulse every 5 seconds |
 
-Battery voltage is checked every 30 seconds in v0.2.5 to reduce blocking pauses.
+Battery voltage is checked every 30 seconds to avoid slowing down the main LED loop.
 
----
+## BLE Advertising Behavior
 
-## Physical LED Priority
+BLE advertising starts at power-up.
 
-The physical LEDs are the most important output.
+If no phone connects within 60 seconds, advertising stops.
 
-Current physical LED update interval:
+If a phone disconnects, advertising restarts for another 60 seconds.
 
-```text
-20 ms
-```
-
-That is about:
-
-```text
-50 updates per second
-```
-
-Firmware v0.2.5 reduces background work by:
-
-- Increasing battery update interval to 30 seconds
-- Disabling serial debug output by default
-- Keeping BLE packets short
-- Stopping BLE advertising after timeout
-- Leaving stability calculation unchanged for now
-
----
-
-## Serial Debug
-
-Serial output is disabled by default in v0.2.5.
-
-In the firmware:
-
-```cpp
-const bool SERIAL_DEBUG = false;
-```
-
-Set it to `true` only when testing with Arduino Serial Monitor.
-
-When enabled, serial output prints every 3 seconds.
-
----
-
-## Documentation
-
-- [LED and Button Behavior](docs/led-and-button-behavior.md)
-
----
-
-## Future App Features
-
-Planned or possible iOS app features:
-
-- Cant zero from app
-- Cant reset from app
-- Pitch zero from app
-- Pitch reset from app
-- Level tolerance setting
-- Pitch and cosine display
-- User-entered target distance
-- Angle-corrected distance
-- Stability display
-- Shot log with pitch, cosine, and stability
-- Diagnostics screen
-
----
-
-## Notes
-
-The 3 external LEDs should stay dedicated to:
-
-```text
-LEFT / LEVEL / RIGHT
-```
-
-Pitch, cosine, stability, battery voltage, diagnostics, and future shot log features are intended for the phone app.
+This helps reduce unnecessary BLE broadcasting and saves some battery.
