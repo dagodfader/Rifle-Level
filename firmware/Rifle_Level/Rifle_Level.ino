@@ -1,28 +1,40 @@
 /*
   Rifle Level Firmware
-  Version: v0.2.5
+  Version: v0.2.9
 
-  BLE packet format version: v:1
+  BLE output is split into short packets to avoid truncation
+  and reduce physical LED slowdown when BLE is connected.
 
-  BLE output is sent as 3 small packets, one packet at a time:
+  Fast live packets, alternating every 200 ms:
 
-  v:1,c:-0.42,o:0.10
+  c:-0.42
   p:1.80,x:0.999
-  s:82,b:3.92
+
+  Slow status packets, alternating every 2000 ms:
+
+  o:0.10,s:82
+  b:3.92,cc:1,pc:1
 
   Field meanings:
-  v = format version
-  c = cant angle for app
-  o = cant calibration offset
-  p = pitch angle
-  x = cosine value
-  s = stability score
-  b = battery voltage
+  c  = cant angle for app
+  p  = pitch angle
+  x  = cosine value
+  o  = cant calibration offset
+  s  = stability score
+  b  = battery voltage
+  cc = cant calibration saved flag, 1 = saved, 0 = not saved
+  pc = pitch calibration saved flag, 1 = saved, 0 = not saved
+
+  iOS app commands:
+  ZERO_CANT   or ZC = save current cant as zero
+  RESET_CANT  or RC = reset cant zero
+  ZERO_PITCH  or ZP = save current pitch as zero
+  RESET_PITCH or RP = reset pitch zero
 
   Notes:
+  - iOS commands can end with \n, \r, or no line ending.
   - BLE/app cant value is inverted from the internal roll value.
   - Physical LED left / level / right behavior is unchanged.
-  - BLE sends one small packet every 150 ms.
   - BLE advertising stops after 60 seconds if no phone connects.
   - If phone disconnects, advertising restarts for another 60 seconds.
   - Battery voltage updates every 30 seconds to reduce blocking pauses.
@@ -34,19 +46,6 @@
   - 3 external LEDs: Left / Level / Right
   - LiPo battery
   - Onboard RGB LED used for battery status
-
-  Features:
-  - Roll/cant level indication
-  - Saved cant calibration using LittleFS
-  - Button brightness control
-  - Button calibration reset
-  - BLE UART output for iOS app
-  - BLE advertising timeout
-  - Startup battery status
-  - Low battery RGB warning
-  - Pitch angle
-  - Angle cosine
-  - Stability score
 */
 
 #include <Wire.h>
@@ -54,6 +53,9 @@
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
 #include <bluefruit.h>
+#include <ctype.h>
+#include <string.h>
+#include <math.h>
 
 using namespace Adafruit_LittleFS_Namespace;
 
@@ -74,13 +76,22 @@ const bool SERIAL_DEBUG = false;
 
 BLEUart bleuart;
 
-unsigned long lastBlePrint = 0;
+// Fast live BLE packets:
+// Alternates between cant and pitch/cosine.
+// Lower rate reduces physical LED slowdown.
+unsigned long lastBleFastPrint = 0;
+const int BLE_FAST_INTERVAL = 150;
+int bleFastStep = 0;
 
-// Keep BLE packet interval the same for now.
-// 150 ms per line = full 3-line app update about every 450 ms.
-const int blePacketInterval = 150;
+// Slow status BLE packets:
+// Alternates between offset/stability and battery/calibration flags.
+unsigned long lastBleSlowPrint = 0;
+const int BLE_SLOW_INTERVAL = 2000;
+int bleSlowStep = 0;
 
-int blePacketStep = 0;
+// BLE command receive buffer
+char bleCommandBuffer[40];
+int bleCommandIndex = 0;
 
 // BLE advertises for 60 seconds after startup.
 // If no phone connects, advertising stops.
@@ -149,8 +160,6 @@ unsigned long lastBatteryWarningCheck = 0;
 unsigned long lastBatteryPulse = 0;
 unsigned long batteryPulseStart = 0;
 
-// Battery update changed from 5 seconds to 30 seconds.
-// Battery voltage changes slowly, and reading it blocks briefly.
 const int BATTERY_CHECK_INTERVAL = 30000;
 
 const int LOW_BATTERY_PULSE_INTERVAL = 10000;
@@ -203,13 +212,17 @@ const int BLINK_SLOW = 250;
 // =====================================================
 
 const char* zeroFilePath = "/zero.txt";
+const char* pitchFilePath = "/pitch.txt";
 
 // =====================================================
 // CALIBRATION
 // =====================================================
 
 float zeroOffset = 0;
+float pitchOffset = 0;
+
 bool hasValidCalibration = false;
+bool hasValidPitchCalibration = false;
 
 // =====================================================
 // LED STATE
@@ -257,9 +270,6 @@ bool firstRead = true;
 // =====================================================
 
 unsigned long lastPrint = 0;
-
-// Serial output is only for testing.
-// It is off by default because SERIAL_DEBUG = false.
 const int printInterval = 3000;
 
 unsigned long lastLoop = 0;
@@ -314,7 +324,9 @@ void setup() {
     DEBUG_PRINTLN("InternalFS mount failed");
   } else {
     DEBUG_PRINTLN("InternalFS mounted");
+
     hasValidCalibration = loadZeroOffset();
+    hasValidPitchCalibration = loadPitchOffset();
   }
 
   setupBLE();
@@ -327,7 +339,7 @@ void setup() {
 
   levelLedsOff();
 
-  if (hasValidCalibration && zeroOffset != 0) {
+  if (hasValidCalibration) {
     showCalibratedStartup();
   } else {
     showNoCalibrationStartup();
@@ -367,7 +379,7 @@ void loop() {
   }
 
   float adjustedRoll = filteredRoll - zeroOffset;
-  float adjustedPitch = filteredPitch;
+  float adjustedPitch = filteredPitch - pitchOffset;
 
   // App cant is inverted so the iOS display matches the desired direction.
   // Physical LED logic still uses adjustedRoll.
@@ -388,6 +400,8 @@ void loop() {
   updateBatteryWarning();
 
   updateBleAdvertisingTimeout();
+
+  handleBleCommands();
 
   updateBLE(appCant, adjustedPitch, cosineValue);
 
@@ -447,16 +461,12 @@ void updateBleAdvertisingTimeout() {
     return;
   }
 
-  // If a phone was connected and then disconnects, restart advertising
-  // for another 60 second window.
   if (wasBleConnected) {
     wasBleConnected = false;
     startBleAdvertisingWindow();
     return;
   }
 
-  // If advertising is active and nobody connected within the timeout,
-  // stop advertising so other phones cannot keep finding it.
   if (bleAdvertisingActive &&
       millis() - bleAdvertisingStartTime >= BLE_ADVERTISE_TIMEOUT) {
 
@@ -470,58 +480,244 @@ void updateBleAdvertisingTimeout() {
 void updateBLE(float appCant, float adjustedPitch, float cosineValue) {
   if (!Bluefruit.connected()) return;
 
-  if (millis() - lastBlePrint < blePacketInterval) return;
+  unsigned long now = millis();
 
-  lastBlePrint = millis();
+  // Fast live packets.
+  // Short packets reduce BLE blocking and avoid truncation.
+  if (now - lastBleFastPrint >= BLE_FAST_INTERVAL) {
+    lastBleFastPrint = now;
 
-  char packet[40];
+    char packet[24];
 
-  if (blePacketStep == 0) {
-    snprintf(packet,
-             sizeof(packet),
-             "v:1,c:%.2f,o:%.2f\n",
-             appCant,
-             zeroOffset);
+    if (bleFastStep == 0) {
+      snprintf(packet,
+               sizeof(packet),
+               "c:%.2f\n",
+               appCant);
+    } else {
+      snprintf(packet,
+               sizeof(packet),
+               "p:%.2f,x:%.3f\n",
+               adjustedPitch,
+               cosineValue);
+    }
+
+    bleuart.print(packet);
+
+    bleFastStep++;
+
+    if (bleFastStep >= 2) {
+      bleFastStep = 0;
+    }
+
+    return;
   }
-  else if (blePacketStep == 1) {
-    snprintf(packet,
-             sizeof(packet),
-             "p:%.2f,x:%.3f\n",
-             adjustedPitch,
-             cosineValue);
-  }
-  else {
-    snprintf(packet,
-             sizeof(packet),
-             "s:%.0f,b:%.2f\n",
-             stabilityScore,
-             latestBatteryVoltage);
-  }
 
-  bleuart.print(packet);
+  // Slow status packets.
+  // Status does not need to update quickly.
+  if (now - lastBleSlowPrint >= BLE_SLOW_INTERVAL) {
+    lastBleSlowPrint = now;
 
-  blePacketStep++;
+    char packet[28];
 
-  if (blePacketStep >= 3) {
-    blePacketStep = 0;
+    if (bleSlowStep == 0) {
+      snprintf(packet,
+               sizeof(packet),
+               "o:%.2f,s:%.0f\n",
+               zeroOffset,
+               stabilityScore);
+    } else {
+      snprintf(packet,
+               sizeof(packet),
+               "b:%.2f,cc:%d,pc:%d\n",
+               latestBatteryVoltage,
+               hasValidCalibration ? 1 : 0,
+               hasValidPitchCalibration ? 1 : 0);
+    }
+
+    bleuart.print(packet);
+
+    bleSlowStep++;
+
+    if (bleSlowStep >= 2) {
+      bleSlowStep = 0;
+    }
   }
 }
 
+// =====================================================
+// BLE COMMANDS FROM IOS APP
+// =====================================================
+
+void handleBleCommands() {
+  if (!Bluefruit.connected()) {
+    bleCommandIndex = 0;
+    return;
+  }
+
+  while (bleuart.available()) {
+    int incoming = bleuart.read();
+
+    if (incoming < 0) {
+      return;
+    }
+
+    char c = (char)incoming;
+
+    // Newline or carriage return means command is complete.
+    // Supports both "\n" and "\r".
+    if (c == '\n' || c == '\r') {
+      if (bleCommandIndex > 0) {
+        bleCommandBuffer[bleCommandIndex] = '\0';
+        processBleCommand(bleCommandBuffer);
+        bleCommandIndex = 0;
+      }
+      continue;
+    }
+
+    // Ignore spaces and tabs.
+    if (c == ' ' || c == '\t') {
+      continue;
+    }
+
+    // Store uppercase command characters.
+    if (bleCommandIndex < (int)sizeof(bleCommandBuffer) - 1) {
+      bleCommandBuffer[bleCommandIndex] =
+        (char)toupper((unsigned char)c);
+
+      bleCommandIndex++;
+      bleCommandBuffer[bleCommandIndex] = '\0';
+
+      // Process immediately if the command already matches.
+      // This allows commands without "\n" to work.
+      if (isKnownBleCommand(bleCommandBuffer)) {
+        processBleCommand(bleCommandBuffer);
+        bleCommandIndex = 0;
+      }
+    } else {
+      bleCommandIndex = 0;
+      sendBleError("BUFFER");
+    }
+  }
+}
+
+bool isKnownBleCommand(const char* command) {
+  return strcmp(command, "ZERO_CANT") == 0 ||
+         strcmp(command, "ZC") == 0 ||
+         strcmp(command, "RESET_CANT") == 0 ||
+         strcmp(command, "RC") == 0 ||
+         strcmp(command, "ZERO_PITCH") == 0 ||
+         strcmp(command, "ZP") == 0 ||
+         strcmp(command, "RESET_PITCH") == 0 ||
+         strcmp(command, "RP") == 0;
+}
+
+void processBleCommand(const char* command) {
+  if (command[0] == '\0') {
+    return;
+  }
+
+  if (strcmp(command, "ZERO_CANT") == 0 || strcmp(command, "ZC") == 0) {
+    zeroCantFromApp();
+  }
+  else if (strcmp(command, "RESET_CANT") == 0 || strcmp(command, "RC") == 0) {
+    resetCantFromApp();
+  }
+  else if (strcmp(command, "ZERO_PITCH") == 0 || strcmp(command, "ZP") == 0) {
+    zeroPitchFromApp();
+  }
+  else if (strcmp(command, "RESET_PITCH") == 0 || strcmp(command, "RP") == 0) {
+    resetPitchFromApp();
+  }
+  else {
+    sendBleError("UNKNOWN");
+  }
+}
+
+void zeroCantFromApp() {
+  zeroOffset = getAverageRoll(20);
+  saveZeroOffset();
+  hasValidCalibration = true;
+
+  sendBleAck("ZERO_CANT");
+
+  DEBUG_PRINTLN("App command: ZERO_CANT");
+
+  blinkCalibration();
+}
+
+void resetCantFromApp() {
+  zeroOffset = 0;
+  clearZeroOffset();
+  hasValidCalibration = false;
+
+  sendBleAck("RESET_CANT");
+
+  DEBUG_PRINTLN("App command: RESET_CANT");
+
+  blinkAllFast();
+}
+
+void zeroPitchFromApp() {
+  pitchOffset = getAveragePitch(20);
+  savePitchOffset();
+  hasValidPitchCalibration = true;
+
+  sendBleAck("ZERO_PITCH");
+
+  DEBUG_PRINTLN("App command: ZERO_PITCH");
+
+  blinkPitchCalibration();
+}
+
+void resetPitchFromApp() {
+  pitchOffset = 0;
+  clearPitchOffset();
+  hasValidPitchCalibration = false;
+
+  sendBleAck("RESET_PITCH");
+
+  DEBUG_PRINTLN("App command: RESET_PITCH");
+
+  blinkPitchReset();
+}
+
+void sendBleAck(const char* commandName) {
+  if (!Bluefruit.connected()) return;
+
+  bleuart.print("ack:");
+  bleuart.print(commandName);
+  bleuart.print("\n");
+}
+
+void sendBleError(const char* errorName) {
+  if (!Bluefruit.connected()) return;
+
+  bleuart.print("err:");
+  bleuart.print(errorName);
+  bleuart.print("\n");
+}
+
 void printSerialPackets(float appCant, float adjustedPitch, float cosineValue) {
-  DEBUG_PRINT("v:1,c:");
-  DEBUG_PRINT(appCant, 2);
-  DEBUG_PRINT(",o:");
-  DEBUG_PRINTLN(zeroOffset, 2);
+  DEBUG_PRINT("c:");
+  DEBUG_PRINTLN(appCant, 2);
 
   DEBUG_PRINT("p:");
   DEBUG_PRINT(adjustedPitch, 2);
   DEBUG_PRINT(",x:");
   DEBUG_PRINTLN(cosineValue, 3);
 
-  DEBUG_PRINT("s:");
-  DEBUG_PRINT(stabilityScore, 0);
-  DEBUG_PRINT(",b:");
-  DEBUG_PRINTLN(latestBatteryVoltage, 2);
+  DEBUG_PRINT("o:");
+  DEBUG_PRINT(zeroOffset, 2);
+  DEBUG_PRINT(",s:");
+  DEBUG_PRINTLN(stabilityScore, 0);
+
+  DEBUG_PRINT("b:");
+  DEBUG_PRINT(latestBatteryVoltage, 2);
+  DEBUG_PRINT(",cc:");
+  DEBUG_PRINT(hasValidCalibration ? 1 : 0);
+  DEBUG_PRINT(",pc:");
+  DEBUG_PRINTLN(hasValidPitchCalibration ? 1 : 0);
 }
 
 // =====================================================
@@ -576,6 +772,18 @@ float getAverageRoll(int samples) {
   for (int i = 0; i < samples; i++) {
     AngleReading angles = readRawAngles();
     sum += angles.roll;
+    delay(5);
+  }
+
+  return sum / samples;
+}
+
+float getAveragePitch(int samples) {
+  float sum = 0;
+
+  for (int i = 0; i < samples; i++) {
+    AngleReading angles = readRawAngles();
+    sum += angles.pitch;
     delay(5);
   }
 
@@ -660,6 +868,7 @@ float readBatteryVoltage() {
   float rawAverage = sum / (float)samples;
   float voltage = (rawAverage / 4095.0) * 3.3;
 
+  // Calibrated battery multiplier.
   voltage *= 3.22;
 
   return voltage;
@@ -713,7 +922,7 @@ bool loadZeroOffset() {
 
   if (!file) {
     zeroOffset = 0;
-    DEBUG_PRINTLN("No saved calibration");
+    DEBUG_PRINTLN("No saved cant calibration");
     return false;
   }
 
@@ -724,13 +933,13 @@ bool loadZeroOffset() {
 
   if (isnan(value) || value < -180.0 || value > 180.0) {
     zeroOffset = 0;
-    DEBUG_PRINTLN("Saved calibration invalid");
+    DEBUG_PRINTLN("Saved cant calibration invalid");
     return false;
   }
 
   zeroOffset = value;
 
-  DEBUG_PRINT("Loaded zeroOffset: ");
+  DEBUG_PRINT("Loaded cant zeroOffset: ");
   DEBUG_PRINTLN(zeroOffset, 6);
 
   return true;
@@ -748,11 +957,78 @@ void saveZeroOffset() {
     file.flush();
     file.close();
 
-    DEBUG_PRINT("Saved zeroOffset: ");
+    DEBUG_PRINT("Saved cant zeroOffset: ");
     DEBUG_PRINTLN(zeroOffset, 6);
   } else {
-    DEBUG_PRINTLN("Save failed");
+    DEBUG_PRINTLN("Cant save failed");
   }
+}
+
+void clearZeroOffset() {
+  if (InternalFS.exists(zeroFilePath)) {
+    InternalFS.remove(zeroFilePath);
+  }
+
+  zeroOffset = 0;
+
+  DEBUG_PRINTLN("Cleared cant calibration");
+}
+
+bool loadPitchOffset() {
+  File file = InternalFS.open(pitchFilePath, FILE_O_READ);
+
+  if (!file) {
+    pitchOffset = 0;
+    DEBUG_PRINTLN("No saved pitch calibration");
+    return false;
+  }
+
+  String text = file.readString();
+  file.close();
+
+  float value = text.toFloat();
+
+  if (isnan(value) || value < -180.0 || value > 180.0) {
+    pitchOffset = 0;
+    DEBUG_PRINTLN("Saved pitch calibration invalid");
+    return false;
+  }
+
+  pitchOffset = value;
+
+  DEBUG_PRINT("Loaded pitchOffset: ");
+  DEBUG_PRINTLN(pitchOffset, 6);
+
+  return true;
+}
+
+void savePitchOffset() {
+  if (InternalFS.exists(pitchFilePath)) {
+    InternalFS.remove(pitchFilePath);
+  }
+
+  File file = InternalFS.open(pitchFilePath, FILE_O_WRITE);
+
+  if (file) {
+    file.println(pitchOffset, 6);
+    file.flush();
+    file.close();
+
+    DEBUG_PRINT("Saved pitchOffset: ");
+    DEBUG_PRINTLN(pitchOffset, 6);
+  } else {
+    DEBUG_PRINTLN("Pitch save failed");
+  }
+}
+
+void clearPitchOffset() {
+  if (InternalFS.exists(pitchFilePath)) {
+    InternalFS.remove(pitchFilePath);
+  }
+
+  pitchOffset = 0;
+
+  DEBUG_PRINTLN("Cleared pitch calibration");
 }
 
 // =====================================================
@@ -851,7 +1127,7 @@ void handleButton() {
 
       if (holdTime >= RESET_HOLD_TIME && !resetDone) {
         zeroOffset = 0;
-        saveZeroOffset();
+        clearZeroOffset();
         hasValidCalibration = false;
 
         resetDone = true;
@@ -972,6 +1248,38 @@ void blinkCalibration() {
     delay(BLINK_SLOW);
     analogWrite(ledCenter, 0);
     delay(BLINK_SLOW);
+  }
+}
+
+// Pitch zero feedback:
+// left and right LEDs blink slowly together.
+void blinkPitchCalibration() {
+  for (int i = 0; i < 3; i++) {
+    analogWrite(ledLeft, LED_BRIGHTNESS);
+    analogWrite(ledRight, LED_BRIGHTNESS);
+
+    delay(BLINK_SLOW);
+
+    analogWrite(ledLeft, 0);
+    analogWrite(ledRight, 0);
+
+    delay(BLINK_SLOW);
+  }
+}
+
+// Pitch reset feedback:
+// left and right LEDs blink quickly together.
+void blinkPitchReset() {
+  for (int i = 0; i < 3; i++) {
+    analogWrite(ledLeft, LED_BRIGHTNESS);
+    analogWrite(ledRight, LED_BRIGHTNESS);
+
+    delay(BLINK_FAST);
+
+    analogWrite(ledLeft, 0);
+    analogWrite(ledRight, 0);
+
+    delay(BLINK_FAST);
   }
 }
 
