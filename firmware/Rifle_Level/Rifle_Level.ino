@@ -1,6 +1,6 @@
 /*
   Rifle Level Firmware
-  Version: v0.2.4
+  Version: v0.2.5
 
   BLE packet format version: v:1
 
@@ -22,7 +22,11 @@
   Notes:
   - BLE/app cant value is inverted from the internal roll value.
   - Physical LED left / level / right behavior is unchanged.
-  - BLE sends one small packet every 150 ms to reduce slowdown.
+  - BLE sends one small packet every 150 ms.
+  - BLE advertising stops after 60 seconds if no phone connects.
+  - If phone disconnects, advertising restarts for another 60 seconds.
+  - Battery voltage updates every 30 seconds to reduce blocking pauses.
+  - Serial debug is off by default to reduce background work.
 
   Hardware:
   - Seeed Studio XIAO nRF52840 Sense
@@ -37,6 +41,7 @@
   - Button brightness control
   - Button calibration reset
   - BLE UART output for iOS app
+  - BLE advertising timeout
   - Startup battery status
   - Low battery RGB warning
   - Pitch angle
@@ -55,6 +60,15 @@ using namespace Adafruit_LittleFS_Namespace;
 LSM6DS3 imu(I2C_MODE, 0x6A);
 
 // =====================================================
+// DEBUG
+// =====================================================
+
+const bool SERIAL_DEBUG = false;
+
+#define DEBUG_PRINT(...)    do { if (SERIAL_DEBUG) Serial.print(__VA_ARGS__); } while (0)
+#define DEBUG_PRINTLN(...)  do { if (SERIAL_DEBUG) Serial.println(__VA_ARGS__); } while (0)
+
+// =====================================================
 // BLE
 // =====================================================
 
@@ -62,11 +76,20 @@ BLEUart bleuart;
 
 unsigned long lastBlePrint = 0;
 
-// Send one small BLE line at a time.
-// 150 ms per line = full 3-line update about every 450 ms.
+// Keep BLE packet interval the same for now.
+// 150 ms per line = full 3-line app update about every 450 ms.
 const int blePacketInterval = 150;
 
 int blePacketStep = 0;
+
+// BLE advertises for 60 seconds after startup.
+// If no phone connects, advertising stops.
+// If phone disconnects, advertising restarts for another 60 seconds.
+const unsigned long BLE_ADVERTISE_TIMEOUT = 60000;
+
+unsigned long bleAdvertisingStartTime = 0;
+bool bleAdvertisingActive = false;
+bool wasBleConnected = false;
 
 // =====================================================
 // IMU ORIENTATION
@@ -126,7 +149,10 @@ unsigned long lastBatteryWarningCheck = 0;
 unsigned long lastBatteryPulse = 0;
 unsigned long batteryPulseStart = 0;
 
-const int BATTERY_CHECK_INTERVAL = 5000;
+// Battery update changed from 5 seconds to 30 seconds.
+// Battery voltage changes slowly, and reading it blocks briefly.
+const int BATTERY_CHECK_INTERVAL = 30000;
+
 const int LOW_BATTERY_PULSE_INTERVAL = 10000;
 const int CRITICAL_BATTERY_PULSE_INTERVAL = 5000;
 const int BATTERY_PULSE_DURATION = 120;
@@ -231,7 +257,10 @@ bool firstRead = true;
 // =====================================================
 
 unsigned long lastPrint = 0;
-const int printInterval = 1000;
+
+// Serial output is only for testing.
+// It is off by default because SERIAL_DEBUG = false.
+const int printInterval = 3000;
 
 unsigned long lastLoop = 0;
 const int loopInterval = 20;
@@ -250,12 +279,15 @@ struct AngleReading {
 // =====================================================
 
 void setup() {
-  Serial.begin(115200);
+  if (SERIAL_DEBUG) {
+    Serial.begin(115200);
+    delay(1000);
+  } else {
+    delay(100);
+  }
 
   analogWriteResolution(8);
   analogReadResolution(12);
-
-  delay(1000);
 
   pinMode(ledLeft, OUTPUT);
   pinMode(ledCenter, OUTPUT);
@@ -273,15 +305,15 @@ void setup() {
   Wire.begin();
 
   if (imu.begin() != 0) {
-    Serial.println("IMU failed");
+    DEBUG_PRINTLN("IMU failed");
   } else {
-    Serial.println("IMU ready");
+    DEBUG_PRINTLN("IMU ready");
   }
 
   if (!InternalFS.begin()) {
-    Serial.println("InternalFS mount failed");
+    DEBUG_PRINTLN("InternalFS mount failed");
   } else {
-    Serial.println("InternalFS mounted");
+    DEBUG_PRINTLN("InternalFS mounted");
     hasValidCalibration = loadZeroOffset();
   }
 
@@ -303,7 +335,7 @@ void setup() {
 
   levelLedsOff();
 
-  Serial.println("System Ready");
+  DEBUG_PRINTLN("System Ready");
 }
 
 // =====================================================
@@ -355,11 +387,12 @@ void loop() {
 
   updateBatteryWarning();
 
+  updateBleAdvertisingTimeout();
+
   updateBLE(appCant, adjustedPitch, cosineValue);
 
-  if (millis() - lastPrint >= printInterval) {
+  if (SERIAL_DEBUG && millis() - lastPrint >= printInterval) {
     lastPrint = millis();
-
     printSerialPackets(appCant, adjustedPitch, cosineValue);
   }
 }
@@ -386,11 +419,52 @@ void setupBLE() {
   Bluefruit.Advertising.addService(bleuart);
   Bluefruit.ScanResponse.addName();
 
-  Bluefruit.Advertising.restartOnDisconnect(true);
+  // We manage reconnect advertising ourselves so we can stop it after timeout.
+  Bluefruit.Advertising.restartOnDisconnect(false);
+
   Bluefruit.Advertising.setInterval(160, 244);
+
+  startBleAdvertisingWindow();
+
+  DEBUG_PRINTLN("BLE UART ready");
+}
+
+void startBleAdvertisingWindow() {
   Bluefruit.Advertising.start(0);
 
-  Serial.println("BLE UART ready");
+  bleAdvertisingStartTime = millis();
+  bleAdvertisingActive = true;
+
+  DEBUG_PRINTLN("BLE advertising started");
+}
+
+void updateBleAdvertisingTimeout() {
+  bool connected = Bluefruit.connected();
+
+  if (connected) {
+    wasBleConnected = true;
+    bleAdvertisingActive = false;
+    return;
+  }
+
+  // If a phone was connected and then disconnects, restart advertising
+  // for another 60 second window.
+  if (wasBleConnected) {
+    wasBleConnected = false;
+    startBleAdvertisingWindow();
+    return;
+  }
+
+  // If advertising is active and nobody connected within the timeout,
+  // stop advertising so other phones cannot keep finding it.
+  if (bleAdvertisingActive &&
+      millis() - bleAdvertisingStartTime >= BLE_ADVERTISE_TIMEOUT) {
+
+    Bluefruit.Advertising.stop();
+    bleAdvertisingActive = false;
+
+    DEBUG_PRINTLN("BLE advertising stopped after timeout");
+  }
 }
 
 void updateBLE(float appCant, float adjustedPitch, float cosineValue) {
@@ -434,20 +508,20 @@ void updateBLE(float appCant, float adjustedPitch, float cosineValue) {
 }
 
 void printSerialPackets(float appCant, float adjustedPitch, float cosineValue) {
-  Serial.print("v:1,c:");
-  Serial.print(appCant, 2);
-  Serial.print(",o:");
-  Serial.println(zeroOffset, 2);
+  DEBUG_PRINT("v:1,c:");
+  DEBUG_PRINT(appCant, 2);
+  DEBUG_PRINT(",o:");
+  DEBUG_PRINTLN(zeroOffset, 2);
 
-  Serial.print("p:");
-  Serial.print(adjustedPitch, 2);
-  Serial.print(",x:");
-  Serial.println(cosineValue, 3);
+  DEBUG_PRINT("p:");
+  DEBUG_PRINT(adjustedPitch, 2);
+  DEBUG_PRINT(",x:");
+  DEBUG_PRINTLN(cosineValue, 3);
 
-  Serial.print("s:");
-  Serial.print(stabilityScore, 0);
-  Serial.print(",b:");
-  Serial.println(latestBatteryVoltage, 2);
+  DEBUG_PRINT("s:");
+  DEBUG_PRINT(stabilityScore, 0);
+  DEBUG_PRINT(",b:");
+  DEBUG_PRINTLN(latestBatteryVoltage, 2);
 }
 
 // =====================================================
@@ -639,7 +713,7 @@ bool loadZeroOffset() {
 
   if (!file) {
     zeroOffset = 0;
-    Serial.println("No saved calibration");
+    DEBUG_PRINTLN("No saved calibration");
     return false;
   }
 
@@ -650,14 +724,14 @@ bool loadZeroOffset() {
 
   if (isnan(value) || value < -180.0 || value > 180.0) {
     zeroOffset = 0;
-    Serial.println("Saved calibration invalid");
+    DEBUG_PRINTLN("Saved calibration invalid");
     return false;
   }
 
   zeroOffset = value;
 
-  Serial.print("Loaded zeroOffset: ");
-  Serial.println(zeroOffset, 6);
+  DEBUG_PRINT("Loaded zeroOffset: ");
+  DEBUG_PRINTLN(zeroOffset, 6);
 
   return true;
 }
@@ -674,10 +748,10 @@ void saveZeroOffset() {
     file.flush();
     file.close();
 
-    Serial.print("Saved zeroOffset: ");
-    Serial.println(zeroOffset, 6);
+    DEBUG_PRINT("Saved zeroOffset: ");
+    DEBUG_PRINTLN(zeroOffset, 6);
   } else {
-    Serial.println("Save failed");
+    DEBUG_PRINTLN("Save failed");
   }
 }
 
@@ -712,22 +786,22 @@ void rgbYellow() {
 void showBatteryStartup() {
   latestBatteryVoltage = readBatteryVoltage();
 
-  Serial.println("===== BATTERY STARTUP =====");
+  DEBUG_PRINTLN("===== BATTERY STARTUP =====");
 
-  Serial.print("Battery Voltage: ");
-  Serial.print(latestBatteryVoltage, 3);
-  Serial.println(" V");
+  DEBUG_PRINT("Battery Voltage: ");
+  DEBUG_PRINT(latestBatteryVoltage, 3);
+  DEBUG_PRINTLN(" V");
 
   if (latestBatteryVoltage >= BAT_GOOD) {
-    Serial.println("Battery GOOD");
+    DEBUG_PRINTLN("Battery GOOD");
     rgbGreen();
   }
   else if (latestBatteryVoltage >= BAT_LOW) {
-    Serial.println("Battery LOW");
+    DEBUG_PRINTLN("Battery LOW");
     rgbYellow();
   }
   else {
-    Serial.println("Battery VERY LOW");
+    DEBUG_PRINTLN("Battery VERY LOW");
     rgbRed();
   }
 
@@ -735,7 +809,7 @@ void showBatteryStartup() {
 
   rgbOff();
 
-  Serial.println("===========================");
+  DEBUG_PRINTLN("===========================");
 }
 
 // =====================================================
@@ -751,8 +825,8 @@ void cycleBrightness() {
 
   LED_BRIGHTNESS = brightnessModes[brightnessIndex];
 
-  Serial.print("Brightness changed to: ");
-  Serial.println(LED_BRIGHTNESS);
+  DEBUG_PRINT("Brightness changed to: ");
+  DEBUG_PRINTLN(LED_BRIGHTNESS);
 
   blinkBrightnessMode();
 }
@@ -782,7 +856,7 @@ void handleButton() {
 
         resetDone = true;
 
-        Serial.println("Calibration reset");
+        DEBUG_PRINTLN("Calibration reset");
         blinkAllFast();
       }
     }
@@ -802,11 +876,11 @@ void handleButton() {
         saveZeroOffset();
         hasValidCalibration = true;
 
-        Serial.println("Calibration saved");
+        DEBUG_PRINTLN("Calibration saved");
         blinkCalibration();
       }
       else {
-        Serial.println("No action");
+        DEBUG_PRINTLN("No action");
       }
     }
   }

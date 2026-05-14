@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.5
+
+- Added BLE advertising timeout
+- Increased battery update interval to 30 seconds
+- Added serial debug switch, off by default
+- Kept BLE packet interval unchanged
+- Kept stability unchanged
+
 ## v0.2.4
 
 - Changed BLE output to send one small packet at a time
