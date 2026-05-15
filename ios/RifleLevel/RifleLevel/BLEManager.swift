@@ -1,3 +1,44 @@
+/*
+  Rifle Level iOS App
+  File: BLEManager.swift
+  Version: iOS BLE v0.4.3
+
+  Changes in v0.4.3:
+  - Format/version field is no longer required from BLE.
+  - Fast live packet can now be:
+    c:-0.42,p:1.80,x:0.999
+
+  - Slow status packet:
+    o:0.10,s:82,b:3.92,cc:1,pc:1
+
+  - Keeps optional v/version parsing if firmware sends it again later.
+  - Keeps calibration flags:
+    cc = cant calibration saved
+    pc = pitch calibration saved
+
+  - Keeps BLE UART RX command writing.
+  - Keeps ack reply handling.
+
+  Nordic UART UUIDs:
+  - Service: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+  - RX:      6E400002-B5A3-F393-E0A9-E50E24DCCA9E
+             App writes here. Device receives here.
+  - TX:      6E400003-B5A3-F393-E0A9-E50E24DCCA9E
+             Device notifies here. App receives here.
+
+  Commands sent:
+  - ZERO_CANT\n
+  - RESET_CANT\n
+  - ZERO_PITCH\n
+  - RESET_PITCH\n
+
+  Expected firmware replies:
+  - ack:ZERO_CANT\n
+  - ack:RESET_CANT\n
+  - ack:ZERO_PITCH\n
+  - ack:RESET_PITCH\n
+*/
+
 import Foundation
 import CoreBluetooth
 import Combine
@@ -17,6 +58,8 @@ struct RifleLevelData {
     var cosine: Double = 1.000
     var stability: Int = 0
     var battery: Double = 0.0
+    var cantCalibrated: Bool = false
+    var pitchCalibrated: Bool = false
 }
 
 final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeripheralDelegate {
@@ -30,19 +73,36 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     @Published var lastPacketDate: Date?
     @Published var packetsReceived: Int = 0
 
+    @Published var lastStatusPacketDate: Date?
+    @Published var statusPacketsReceived: Int = 0
+
+    @Published var lastCommandSent: String = "None"
+    @Published var lastCommandReply: String = "No reply yet"
+
     let targetDeviceName = "RifleLevel"
+
+    private let uartServiceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+    private let uartRXUUID = CBUUID(string: "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+    private let uartTXUUID = CBUUID(string: "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
     private var centralManager: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
+
+    private var rxCharacteristic: CBCharacteristic?
+    private var txCharacteristic: CBCharacteristic?
+
     private var isConnectingToTarget = false
 
     private var receiveBuffer: String = ""
-    private var rawPacketLines: [String] = []
+    private var lastLivePacketLine: String?
+    private var lastStatusPacketLine: String?
 
     override init() {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: .main)
     }
+
+    // MARK: - Bluetooth State
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
@@ -69,6 +129,8 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             bluetoothStatus = "Unknown Bluetooth error"
         }
     }
+
+    // MARK: - Scanning / Connection
 
     func startScan() {
         guard centralManager.state == .poweredOn else {
@@ -153,16 +215,27 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         isConnectingToTarget = false
         connectedDeviceName = peripheral.name ?? targetDeviceName
-        bluetoothStatus = "Connected. Looking for services..."
+        bluetoothStatus = "Connected. Looking for UART service..."
 
         receiveBuffer = ""
-        rawPacketLines.removeAll()
+        lastLivePacketLine = nil
+        lastStatusPacketLine = nil
         rawData = "No data yet"
+
         lastPacketDate = nil
         packetsReceived = 0
 
+        lastStatusPacketDate = nil
+        statusPacketsReceived = 0
+
+        rxCharacteristic = nil
+        txCharacteristic = nil
+
+        lastCommandSent = "None"
+        lastCommandReply = "No reply yet"
+
         peripheral.delegate = self
-        peripheral.discoverServices(nil)
+        peripheral.discoverServices([uartServiceUUID])
     }
 
     func centralManager(
@@ -176,8 +249,18 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         bluetoothStatus = "Failed to connect. Scanning again..."
 
         receiveBuffer = ""
-        rawPacketLines.removeAll()
+        lastLivePacketLine = nil
+        lastStatusPacketLine = nil
+        rawData = "No data yet"
+
         lastPacketDate = nil
+        packetsReceived = 0
+
+        lastStatusPacketDate = nil
+        statusPacketsReceived = 0
+
+        rxCharacteristic = nil
+        txCharacteristic = nil
 
         startScan()
     }
@@ -194,11 +277,22 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
 
         rawData = "No data yet"
         receiveBuffer = ""
-        rawPacketLines.removeAll()
+        lastLivePacketLine = nil
+        lastStatusPacketLine = nil
+
         lastPacketDate = nil
+        packetsReceived = 0
+
+        lastStatusPacketDate = nil
+        statusPacketsReceived = 0
+
+        rxCharacteristic = nil
+        txCharacteristic = nil
 
         startScan()
     }
+
+    // MARK: - Services / Characteristics
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         if let error = error {
@@ -206,15 +300,16 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             return
         }
 
-        guard let services = peripheral.services else {
-            bluetoothStatus = "No services found"
+        guard let services = peripheral.services, !services.isEmpty else {
+            bluetoothStatus = "UART service not found"
             return
         }
 
-        bluetoothStatus = "Found \(services.count) service(s). Looking for data..."
-
         for service in services {
-            peripheral.discoverCharacteristics(nil, for: service)
+            if service.uuid == uartServiceUUID {
+                bluetoothStatus = "UART service found. Looking for RX/TX..."
+                peripheral.discoverCharacteristics([uartRXUUID, uartTXUUID], for: service)
+            }
         }
     }
 
@@ -229,20 +324,36 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
         }
 
         guard let characteristics = service.characteristics else {
+            bluetoothStatus = "No UART characteristics found"
             return
         }
 
         for characteristic in characteristics {
-            if characteristic.properties.contains(.notify) {
-                peripheral.setNotifyValue(true, for: characteristic)
-                bluetoothStatus = "Subscribed to live data"
+            if characteristic.uuid == uartRXUUID {
+                rxCharacteristic = characteristic
             }
 
-            if characteristic.properties.contains(.read) {
-                peripheral.readValue(for: characteristic)
+            if characteristic.uuid == uartTXUUID {
+                txCharacteristic = characteristic
+
+                if characteristic.properties.contains(.notify) {
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
             }
         }
+
+        if rxCharacteristic != nil && txCharacteristic != nil {
+            bluetoothStatus = "Live data and commands ready"
+        } else if txCharacteristic != nil {
+            bluetoothStatus = "Live data ready. Commands not ready."
+        } else if rxCharacteristic != nil {
+            bluetoothStatus = "Commands ready. Live data not ready."
+        } else {
+            bluetoothStatus = "UART RX/TX not found"
+        }
     }
+
+    // MARK: - Receiving BLE Data
 
     func peripheral(
         _ peripheral: CBPeripheral,
@@ -251,6 +362,10 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     ) {
         if let error = error {
             bluetoothStatus = "Data read error: \(error.localizedDescription)"
+            return
+        }
+
+        guard characteristic.uuid == uartTXUUID else {
             return
         }
 
@@ -290,22 +405,92 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
     private func handleCompletePacketLine(_ packet: String) {
         let lowerPacket = packet.lowercased()
 
-        if lowerPacket.hasPrefix("v:") {
-            rawPacketLines.removeAll()
+        if lowerPacket.hasPrefix("ack:") {
+            lastCommandReply = packet
+            return
         }
 
-        rawPacketLines.append(packet)
+        let keys = packetKeys(packet)
 
-        if rawPacketLines.count > 3 {
-            rawPacketLines.removeFirst(rawPacketLines.count - 3)
-        }
+        let isLivePacket =
+            keys.contains("v") ||
+            keys.contains("version") ||
+            keys.contains("c") ||
+            keys.contains("cant") ||
+            keys.contains("p") ||
+            keys.contains("pitch") ||
+            keys.contains("x") ||
+            keys.contains("cos") ||
+            keys.contains("cosine")
 
-        rawData = rawPacketLines.joined(separator: "\n")
+        let isStatusPacket =
+            keys.contains("o") ||
+            keys.contains("offset") ||
+            keys.contains("s") ||
+            keys.contains("stable") ||
+            keys.contains("stability") ||
+            keys.contains("b") ||
+            keys.contains("batt") ||
+            keys.contains("battery") ||
+            keys.contains("cc") ||
+            keys.contains("pc")
 
         parseRifleLevelData(packet)
 
-        lastPacketDate = Date()
-        packetsReceived += 1
+        if isLivePacket {
+            lastLivePacketLine = packet
+            lastPacketDate = Date()
+            packetsReceived += 1
+        }
+
+        if isStatusPacket {
+            lastStatusPacketLine = packet
+            lastStatusPacketDate = Date()
+            statusPacketsReceived += 1
+        }
+
+        updateRawDataDisplay()
+    }
+
+    private func packetKeys(_ text: String) -> Set<String> {
+        let cleaned = text
+            .replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\r", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let parts = cleaned.split(separator: ",")
+
+        var keys = Set<String>()
+
+        for part in parts {
+            let keyValue = part.split(separator: ":", maxSplits: 1)
+
+            guard keyValue.count == 2 else {
+                continue
+            }
+
+            let key = keyValue[0]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+
+            keys.insert(key)
+        }
+
+        return keys
+    }
+
+    private func updateRawDataDisplay() {
+        var lines: [String] = []
+
+        if let lastLivePacketLine {
+            lines.append(lastLivePacketLine)
+        }
+
+        if let lastStatusPacketLine {
+            lines.append(lastStatusPacketLine)
+        }
+
+        rawData = lines.isEmpty ? "No data yet" : lines.joined(separator: "\n")
     }
 
     private func parseRifleLevelData(_ text: String) {
@@ -358,11 +543,55 @@ final class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CB
             case "b", "batt", "battery":
                 updatedData.battery = Double(value) ?? updatedData.battery
 
+            case "cc", "cantcal", "cantcalibrated":
+                updatedData.cantCalibrated = value == "1" || value.lowercased() == "true"
+
+            case "pc", "pitchcal", "pitchcalibrated":
+                updatedData.pitchCalibrated = value == "1" || value.lowercased() == "true"
+
             default:
                 break
             }
         }
 
         levelData = updatedData
+    }
+
+    // MARK: - Sending BLE Commands
+
+    func sendCommand(_ command: String) {
+        guard let peripheral = connectedPeripheral else {
+            bluetoothStatus = "Command failed: not connected"
+            return
+        }
+
+        guard let rxCharacteristic = rxCharacteristic else {
+            bluetoothStatus = "Command failed: UART RX not found"
+            lastCommandSent = command.trimmingCharacters(in: .whitespacesAndNewlines)
+            lastCommandReply = "No UART RX characteristic"
+            return
+        }
+
+        guard let data = command.data(using: .utf8) else {
+            bluetoothStatus = "Command failed: invalid text"
+            return
+        }
+
+        let trimmedCommand = command.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if rxCharacteristic.properties.contains(.write) {
+            peripheral.writeValue(data, for: rxCharacteristic, type: .withResponse)
+        } else if rxCharacteristic.properties.contains(.writeWithoutResponse) {
+            peripheral.writeValue(data, for: rxCharacteristic, type: .withoutResponse)
+        } else {
+            bluetoothStatus = "Command failed: RX is not writable"
+            lastCommandSent = trimmedCommand
+            lastCommandReply = "RX is not writable"
+            return
+        }
+
+        lastCommandSent = trimmedCommand
+        lastCommandReply = "Waiting for reply..."
+        bluetoothStatus = "Sent: \(trimmedCommand)"
     }
 }
